@@ -3,108 +3,255 @@ import { randomBytes } from "crypto";
 
 export async function POST(req) {
   try {
-    const { email } = await req.json();
+    /*
+     * =====================================================
+     * 1. GET AUTHENTICATED USER
+     * =====================================================
+     *
+     * The user's Supabase access token must be sent as:
+     *
+     * Authorization: Bearer <access_token>
+     *
+     * We NEVER use email as the ownership mechanism.
+     */
 
-    // 1. Validate email
-    if (!email || typeof email !== "string") {
+    const authorization =
+      req.headers.get("authorization") || "";
+
+    if (
+      !authorization.startsWith("Bearer ")
+    ) {
       return Response.json(
-        { error: "Email is required." },
-        { status: 400 }
+        {
+          error:
+            "Authentication is required.",
+        },
+        { status: 401 }
       );
     }
 
-    const cleanEmail = email.trim().toLowerCase();
+    const accessToken =
+      authorization.replace(
+        "Bearer ",
+        ""
+      ).trim();
 
-    // 2. Validate email format
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    if (!accessToken) {
       return Response.json(
-        { error: "Please enter a valid email address." },
-        { status: 400 }
+        {
+          error:
+            "Authentication token is missing.",
+        },
+        { status: 401 }
       );
     }
 
-    // 3. Check whether this email already has a BOMBA key
-    const { data: existingKey, error: lookupError } = await supabase
-      .from("bomba_keys")
-      .select("key_code, videos_allowed, videos_used")
-      .eq("email", cleanEmail)
-      .maybeSingle();
+    const {
+      data: {
+        user,
+      },
+      error: authError,
+    } =
+      await supabase.auth.getUser(
+        accessToken
+      );
 
-    if (lookupError) {
-      console.error("BOMBA API KEY LOOKUP ERROR:", lookupError);
+    if (authError || !user) {
+      console.error(
+        "BOMBA AUTH ERROR:",
+        authError
+      );
 
       return Response.json(
         {
           error:
-            lookupError.message ||
+            "Your session is invalid or has expired.",
+        },
+        { status: 401 }
+      );
+    }
+
+    /*
+     * =====================================================
+     * 2. USER ID IS THE REAL OWNER
+     * =====================================================
+     */
+
+    const userId = user.id;
+
+    const email =
+      typeof user.email === "string"
+        ? user.email.trim().toLowerCase()
+        : "";
+
+    if (!email) {
+      return Response.json(
+        {
+          error:
+            "Your account does not have an email address.",
+        },
+        { status: 400 }
+      );
+    }
+
+    /*
+     * =====================================================
+     * 3. FIND ONLY THIS USER'S BOMBA KEY
+     * =====================================================
+     *
+     * IMPORTANT:
+     * We search by user_id, NOT by email.
+     */
+
+    const {
+      data: existingKey,
+      error: lookupError,
+    } = await supabase
+      .from("bomba_keys")
+      .select(
+        "key_code, videos_allowed, videos_used"
+      )
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (lookupError) {
+      console.error(
+        "BOMBA API KEY LOOKUP ERROR:",
+        lookupError
+      );
+
+      return Response.json(
+        {
+          error:
             "Unable to check your BOMBA API Key.",
         },
         { status: 500 }
       );
     }
 
-    // 4. One email = one BOMBA key
+    /*
+     * =====================================================
+     * 4. EXISTING KEY
+     * =====================================================
+     */
+
     if (existingKey) {
+      const allowed =
+        Number(
+          existingKey.videos_allowed
+        ) || 0;
+
+      const used =
+        Number(
+          existingKey.videos_used
+        ) || 0;
+
       return Response.json({
         success: true,
         key: existingKey.key_code,
-        videos_allowed: existingKey.videos_allowed,
-        videos_used: existingKey.videos_used,
+        videos_allowed: allowed,
+        videos_used: used,
         remaining_videos: Math.max(
           0,
-          (existingKey.videos_allowed || 0) -
-            (existingKey.videos_used || 0)
+          allowed - used
         ),
-        message: "You already have a BOMBA API Key.",
+        message:
+          "You already have a BOMBA API Key.",
       });
     }
 
-    // 5. Generate a cryptographically secure BOMBA API key
-    const key_code =
-      "bomba_" + randomBytes(32).toString("hex");
+    /*
+     * =====================================================
+     * 5. GENERATE SECURE BOMBA KEY
+     * =====================================================
+     */
 
-    // 6. Create the 3-video free trial
-    const { data, error } = await supabase
+    const key_code =
+      "bomba_" +
+      randomBytes(32).toString("hex");
+
+    /*
+     * =====================================================
+     * 6. CREATE USER-OWNED KEY
+     * =====================================================
+     */
+
+    const {
+      data,
+      error,
+    } = await supabase
       .from("bomba_keys")
       .insert([
         {
+          user_id: userId,
+          email,
           key_code,
-          email: cleanEmail,
           videos_allowed: 3,
           videos_used: 0,
         },
       ])
-      .select()
+      .select(
+        "key_code, videos_allowed, videos_used"
+      )
       .single();
 
     if (error) {
-      console.error("BOMBA API KEY CREATE ERROR:", error);
+      console.error(
+        "BOMBA API KEY CREATE ERROR:",
+        error
+      );
 
       return Response.json(
         {
           error:
-            error.message ||
             "Failed to create your BOMBA API Key.",
         },
         { status: 500 }
       );
     }
 
-    // 7. Return the new key and trial information
+    /*
+     * =====================================================
+     * 7. RETURN USER'S KEY
+     * =====================================================
+     */
+
+    const allowed =
+      Number(
+        data.videos_allowed
+      ) || 0;
+
+    const used =
+      Number(
+        data.videos_used
+      ) || 0;
+
     return Response.json({
       success: true,
-      key: data.key_code,
-      videos_allowed: data.videos_allowed,
-      videos_used: data.videos_used,
-      remaining_videos: Math.max(
-        0,
-        data.videos_allowed - data.videos_used
-      ),
+
+      key:
+        data.key_code,
+
+      videos_allowed:
+        allowed,
+
+      videos_used:
+        used,
+
+      remaining_videos:
+        Math.max(
+          0,
+          allowed - used
+        ),
+
       message:
         "BOMBA API Key created successfully. You have 3 free video generations.",
     });
   } catch (error) {
-    console.error("BOMBA API KEY ERROR:", error);
+    console.error(
+      "BOMBA API KEY ERROR:",
+      error
+    );
 
     return Response.json(
       {
