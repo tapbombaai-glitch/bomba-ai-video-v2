@@ -1142,27 +1142,56 @@ const voiceTracksRef = useRef([]);
     };
   };
 
-  /* =====================================================
-     FINALIZE VIDEO WITH BOMBA VOICES
-  ===================================================== */
+  // =====================================================
+// FINALIZE VIDEO WITH BOMBA VOICES
+// FUNCTION: finalizeVideoWithVoice
+// =====================================================
 
-  const finalizeVideoWithVoice = async (
-    generatedVideoUrl
-  ) => {
-    const production =
-      getProduction();
+const finalizeVideoWithVoice = async (
+  generatedVideoUrl,
+  providedVoiceTracks = null
+) => {
+  const production = getProduction();
 
-    const soundData =
-      production?.sound?.data ||
-      production?.sound ||
-      null;
+  const soundData =
+    production?.sound?.data ||
+    production?.sound ||
+    null;
 
-    if (!generatedVideoUrl) {
-      return generatedVideoUrl;
-    }
+  if (!generatedVideoUrl) {
+    throw new Error(
+      "Generated video URL is missing."
+    );
+  }
 
-    let voiceTracks = [];
+  // ---------------------------------------------------
+  // 1. Prefer the voice tracks from THIS production.
+  // ---------------------------------------------------
 
+  let voiceTracks = Array.isArray(
+    providedVoiceTracks
+  )
+    ? providedVoiceTracks
+    : [];
+
+  // ---------------------------------------------------
+  // 2. If not provided, use the current ref.
+  // ---------------------------------------------------
+
+  if (!voiceTracks.length) {
+    voiceTracks =
+      Array.isArray(
+        voiceTracksRef.current
+      )
+        ? voiceTracksRef.current
+        : [];
+  }
+
+  // ---------------------------------------------------
+  // 3. Last fallback: localStorage.
+  // ---------------------------------------------------
+
+  if (!voiceTracks.length) {
     try {
       const storedTracks =
         localStorage.getItem(
@@ -1174,187 +1203,222 @@ const voiceTracksRef = useRef([]);
           JSON.parse(storedTracks);
 
         if (
-          Array.isArray(
-            parsedTracks
-          )
+          Array.isArray(parsedTracks)
         ) {
           voiceTracks =
-            parsedTracks.filter(
-              (track) =>
-                track?.publicId
-            );
+            parsedTracks;
         }
       }
     } catch (storageError) {
-      console.error(
-        "BOMBA VOICE TRACK STORAGE ERROR:",
+      console.warn(
+        "BOMBA: Unable to read saved voice tracks.",
         storageError
       );
     }
+  }
 
-    if (!voiceTracks.length) {
-      let legacyVoicePublicId = "";
+  // ---------------------------------------------------
+  // 4. Normalize voice tracks for the server.
+  // ---------------------------------------------------
 
-      try {
-        legacyVoicePublicId =
-          localStorage.getItem(
-            "bomba_voice_public_id"
-          ) || "";
-      } catch (storageError) {
-        console.error(
-          "BOMBA LEGACY VOICE STORAGE ERROR:",
-          storageError
-        );
-      }
+  voiceTracks =
+    voiceTracks
+      .map((track) => ({
+        publicId: String(
+          track?.publicId ||
+            track?.cloudinaryPublicId ||
+            ""
+        ).trim(),
 
-      if (legacyVoicePublicId) {
-        voiceTracks = [
-          {
-            publicId:
-              legacyVoicePublicId,
-            startTime: 0,
-          },
-        ];
-      }
-    }
+        startTime:
+          Number.isFinite(
+            Number(track?.startTime)
+          )
+            ? Number(track.startTime)
+            : 0,
 
-    if (!voiceTracks.length) {
-      console.log(
-        "BOMBA: No Cloudinary voice tracks found. Keeping original video."
-      );
+        speaker:
+          track?.speaker ||
+          "Character",
 
-      return generatedVideoUrl;
-    }
+        voiceId:
+          track?.voiceId ||
+          null,
 
-    voiceTracks =
-      voiceTracks.map(
-        (track) => ({
-          publicId:
-            String(
-              track?.publicId ||
-              track?.cloudinaryPublicId ||
-              ""
-            ).trim(),
+        language:
+          track?.language ||
+          "pcm",
 
-          startTime:
-            Number.isFinite(
-              Number(
-                track?.startTime
-              )
-            )
-              ? Number(
-                  track.startTime
-                )
-              : 0,
-        })
-      ).filter(
+        audioUrl:
+          track?.audioUrl ||
+          null,
+      }))
+      .filter(
         (track) =>
           track.publicId
       );
 
-    if (!voiceTracks.length) {
-      console.log(
-        "BOMBA: Voice tracks were empty after cleanup. Keeping original video."
-      );
+  // ---------------------------------------------------
+  // 5. Voice is REQUIRED.
+  // Do NOT silently return a silent video.
+  // ---------------------------------------------------
 
-      return generatedVideoUrl;
-    }
-
-    console.log(
-      "======================================"
+  if (!voiceTracks.length) {
+    throw new Error(
+      "No BOMBA AI voice tracks are available for finalization."
     );
+  }
 
-    console.log(
-      "BOMBA FINALIZER VOICE HANDOFF"
+  console.log(
+    "======================================"
+  );
+
+  console.log(
+    "BOMBA FINALIZER VOICE HANDOFF"
+  );
+
+  console.log(
+    "VIDEO:",
+    generatedVideoUrl
+  );
+
+  console.log(
+    "VOICE TRACK COUNT:",
+    voiceTracks.length
+  );
+
+  console.log(
+    "VOICE TRACKS:",
+    voiceTracks
+  );
+
+  console.log(
+    "======================================"
+  );
+
+  setStatus(
+    `Adding ${voiceTracks.length} BOMBA AI voice tracks... 🎙️`
+  );
+
+  // ---------------------------------------------------
+  // 6. Server finalizer requires HTTP/HTTPS.
+  // ---------------------------------------------------
+
+  if (
+    !generatedVideoUrl.startsWith(
+      "http://"
+    ) &&
+    !generatedVideoUrl.startsWith(
+      "https://"
+    )
+  ) {
+    throw new Error(
+      "The generated video is not available as a server-accessible URL yet."
     );
+  }
 
-    console.log(
-      "VOICE TRACK COUNT:",
-      voiceTracks.length
-    );
+  // ---------------------------------------------------
+  // 7. Send video + voices + sound to FFmpeg route.
+  // ---------------------------------------------------
 
-    console.log(
-      "VOICE TRACKS:",
-      voiceTracks
-    );
+  const finalizeResponse =
+    await fetch(
+      "/api/video/finalize",
+      {
+        method: "POST",
 
-    console.log(
-      "======================================"
-    );
+        headers: {
+          "Content-Type":
+            "application/json",
 
-    setStatus(
-      `Video ready. Adding ${voiceTracks.length} BOMBA AI voice tracks... 🎙️`
-    );
+          Accept:
+            "application/json",
+        },
 
-    const finalizeResponse =
-      await fetch(
-        "/api/video/finalize",
-        {
-          method: "POST",
+        body: JSON.stringify({
+          videoUrl:
+            generatedVideoUrl,
 
-          headers: {
-            "Content-Type":
-              "application/json",
+          voiceTracks,
 
-            Accept:
-              "application/json",
-          },
+          sound: soundData
+            ? {
+                audioUrl:
+                  soundData?.audioUrl ||
+                  soundData?.audio_url ||
+                  null,
 
-          body: JSON.stringify({
-            videoUrl:
-              generatedVideoUrl,
-
-            voiceTracks,
-
-            sound: soundData
-              ? {
-                  audioUrl:
-                    soundData?.audioUrl ||
-                    soundData?.audio_url ||
-                    null,
-
-                  duration:
-                    Number.isFinite(
-                      Number(
-                        soundData?.duration
-                      )
+                duration:
+                  Number.isFinite(
+                    Number(
+                      soundData?.duration
                     )
-                      ? Number(
-                          soundData.duration
-                        )
-                      : null,
-                }
-              : null,
-          }),
-        }
-      );
-
-    const finalizeData =
-      await readJsonResponse(
-        finalizeResponse
-      );
-
-    if (
-      !finalizeResponse.ok ||
-      finalizeData?.status !==
-        "completed" ||
-      !finalizeData?.videoUrl
-    ) {
-      throw new Error(
-        getSafeErrorMessage(
-          finalizeData,
-          "Unable to attach the BOMBA AI voices to the video."
-        )
-      );
-    }
-
-    console.log(
-      "BOMBA FINAL VIDEO WITH VOICES READY:",
-      finalizeData.videoUrl
+                  )
+                    ? Number(
+                        soundData.duration
+                      )
+                    : null,
+              }
+            : null,
+        }),
+      }
     );
 
-    return finalizeData.videoUrl;
-  };
+  const finalizeData =
+    await readJsonResponse(
+      finalizeResponse
+    );
+
+  if (!finalizeResponse.ok) {
+    throw new Error(
+      getSafeErrorMessage(
+        finalizeData,
+        `Video finalization failed with HTTP ${finalizeResponse.status}.`
+      )
+    );
+  }
+
+  if (
+    finalizeData?.status !==
+    "completed"
+  ) {
+    throw new Error(
+      getSafeErrorMessage(
+        finalizeData,
+        "BOMBA video finalization did not complete."
+      )
+    );
+  }
+
+  const finalVideoUrl =
+    finalizeData?.finalVideoUrl ||
+    finalizeData?.videoUrl ||
+    null;
+
+  if (!finalVideoUrl) {
+    throw new Error(
+      "BOMBA finalizer completed but returned no final video URL."
+    );
+  }
+
+  console.log(
+    "======================================"
+  );
+
+  console.log(
+    "BOMBA FINAL VIDEO READY"
+  );
+
+  console.log(
+    finalVideoUrl
+  );
+
+  console.log(
+    "======================================"
+  );
+
+  return finalVideoUrl;
+};
 
   /* =====================================================
      COMPLETE FINAL PRODUCTION STAGES
