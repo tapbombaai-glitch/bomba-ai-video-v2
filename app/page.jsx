@@ -2060,41 +2060,59 @@ completeFinalStages(
       "07/12 — Generating AI voices... 🎙️"
     );
 
-    let voiceData = null;
+    // VOICE
+setStatus("08/12 — Generating character voices...");
 
-    try {
-      voiceData =
-        await generateMasterVoice(
-          dialogue,
-          characters
-        );
+let voiceData = null;
 
-      production =
-        markStage(
-          "voices",
-          voiceData
-        ) ||
-        production;
-    } catch (voiceError) {
-      console.error(
-        "BOMBA MASTER VOICE ERROR:",
-        voiceError
-      );
+try {
+  voiceData = await generateMasterVoice(
+    dialogue,
+    characters
+  );
 
-      production =
-        markStage(
-          "voices",
-          {
-            status: "failed",
-            error:
-              voiceError?.message ||
-              "Voice generation failed.",
-            createdAt:
-              new Date().toISOString(),
-          }
-        ) ||
-        production;
-    }
+  if (
+    !voiceData ||
+    !Array.isArray(voiceData.voiceTracks) ||
+    !voiceData.voiceTracks.length
+  ) {
+    throw new Error(
+      "Voice generation completed without any voice tracks."
+    );
+  }
+
+  production =
+    markStage("voices", voiceData) ||
+    production;
+
+  console.log(
+    "BOMBA: Voice generation successful:",
+    voiceData.voiceTracks
+  );
+} catch (voiceError) {
+  console.error(
+    "BOMBA: Voice generation failed:",
+    voiceError
+  );
+
+  production =
+    markStage("voices", {
+      status: "failed",
+      error:
+        voiceError?.message ||
+        "Voice generation failed.",
+      createdAt:
+        new Date().toISOString(),
+    }) ||
+    production;
+
+  throw new Error(
+    `Voice generation failed: ${
+      voiceError?.message ||
+      "Unable to generate voice."
+    }`
+  );
+}
 
     /* =============================================
        08 — SOUND
