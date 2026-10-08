@@ -83,7 +83,7 @@ throw new Error(
 }
 
 const uploadUrl =
-https://api.cloudinary.com/v1_1/${encodeURIComponent(   CLOUDINARY_CLOUD_NAME   )}/video/upload;
+`https://api.cloudinary.com/v1_1/${encodeURIComponent(CLOUDINARY_CLOUD_NAME)}/video/upload`;
 
 const formData = new FormData();
 
