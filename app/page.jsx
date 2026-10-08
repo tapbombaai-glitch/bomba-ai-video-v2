@@ -2148,7 +2148,13 @@ try {
       "Voice generation completed without any voice tracks."
     );
   }
+voiceTracksRef.current =
+  voiceData.voiceTracks;
 
+console.log(
+  "BOMBA: Current production voice tracks saved:",
+  voiceTracksRef.current
+);
   production =
     markStage("voices", voiceData) ||
     production;
