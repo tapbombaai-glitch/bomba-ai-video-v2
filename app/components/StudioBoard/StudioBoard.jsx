@@ -117,7 +117,7 @@ if (!response.ok) {
 throw new Error(
 data?.error?.message ||
 data?.error ||
-Cloudinary voice upload failed with HTTP ${response.status}.
+`Cloudinary voice upload failed with HTTP ${response.status}.`
 );
 }
 
