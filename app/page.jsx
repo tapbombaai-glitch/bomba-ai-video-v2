@@ -38,7 +38,10 @@ export default function Home() {
   const [apiMessage, setApiMessage] = useState("");
 
   const pollingRef = useRef(null);
-  const fileInputRef = useRef(null);
+const fileInputRef = useRef(null);
+
+// Holds the voice tracks generated for the CURRENT production.
+const voiceTracksRef = useRef([]);
 
   const modes = [
     "Movie",
