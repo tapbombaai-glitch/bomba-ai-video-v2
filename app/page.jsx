@@ -1520,7 +1520,8 @@ export default function Home() {
 
           const finalVideoUrl =
   await finalizeVideoWithVoice(
-    generatedVideoUrl
+    directVideoUrl,
+    voiceData?.voiceTracks
   );
 
 // Only revoke the temporary blob URL
