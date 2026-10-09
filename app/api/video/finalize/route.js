@@ -1,3 +1,5 @@
+// FILE: app/api/video/finalize/route.js
+
 import { NextResponse } from "next/server";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
@@ -21,6 +23,24 @@ const CLOUDINARY_UPLOAD_URL = CLOUDINARY_CLOUD_NAME
     )}/video/upload`
   : "";
 
+const MAX_VOICE_TRACKS = 20;
+const MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024;
+
+function jsonError(message, status = 500) {
+  return NextResponse.json(
+    {
+      status: "failed",
+      error: message,
+    },
+    {
+      status,
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    }
+  );
+}
+
 function safeParse(text) {
   try {
     return JSON.parse(text);
@@ -29,57 +49,184 @@ function safeParse(text) {
   }
 }
 
-function cloudinaryAudioUrl(publicId) {
-  const cleanId = String(publicId || "")
+function isHttpUrl(value) {
+  try {
+    const url = new URL(value);
+
+    return (
+      url.protocol === "https:" ||
+      url.protocol === "http:"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function cloudinaryAudioUrl(track) {
+  const publicId = String(
+    track?.cloudinaryPublicId ||
+      track?.publicId ||
+      ""
+  )
     .trim()
     .replace(/^\/+/, "");
 
-  if (!cleanId || !CLOUDINARY_CLOUD_NAME) {
+  if (!publicId || !CLOUDINARY_CLOUD_NAME) {
     return "";
   }
 
-  return `https://res.cloudinary.com/${encodeURIComponent(
-    CLOUDINARY_CLOUD_NAME
-  )}/video/upload/${cleanId}.mp3`;
+  const resourceType =
+    track?.resourceType === "video" ||
+    track?.resourceType === "raw" ||
+    track?.resourceType === "image"
+      ? track.resourceType
+      : "video";
+
+  const format =
+    typeof track?.format === "string" &&
+    /^[a-zA-Z0-9]+$/.test(track.format)
+      ? track.format
+      : "mp3";
+
+  return (
+    `https://res.cloudinary.com/` +
+    `${encodeURIComponent(CLOUDINARY_CLOUD_NAME)}/` +
+    `${resourceType}/upload/` +
+    `${publicId}.${format}`
+  );
+}
+
+function normalizeVoiceTracks(body) {
+  const incoming = Array.isArray(body?.voiceTracks)
+    ? body.voiceTracks
+    : [];
+
+  const legacyPublicId =
+    typeof body?.voicePublicId === "string"
+      ? body.voicePublicId.trim()
+      : "";
+
+  const tracks =
+    incoming.length > 0
+      ? incoming
+      : legacyPublicId
+      ? [
+          {
+            publicId: legacyPublicId,
+            startTime: 0,
+          },
+        ]
+      : [];
+
+  if (tracks.length > MAX_VOICE_TRACKS) {
+    throw new Error(
+      `A maximum of ${MAX_VOICE_TRACKS} voice tracks is allowed.`
+    );
+  }
+
+  return tracks.map((track, index) => {
+    const startTime = Number(track?.startTime ?? 0);
+
+    if (
+      !Number.isFinite(startTime) ||
+      startTime < 0 ||
+      startTime > 3600
+    ) {
+      throw new Error(
+        `Voice track ${index + 1} has an invalid start time.`
+      );
+    }
+
+    const suppliedUrl =
+      typeof track?.audioUrl === "string"
+        ? track.audioUrl.trim()
+        : "";
+
+    const publicId =
+      typeof track?.cloudinaryPublicId === "string"
+        ? track.cloudinaryPublicId.trim()
+        : typeof track?.publicId === "string"
+        ? track.publicId.trim()
+        : "";
+
+    const audioUrl = isHttpUrl(suppliedUrl)
+      ? suppliedUrl
+      : cloudinaryAudioUrl(track);
+
+    if (!audioUrl) {
+      throw new Error(
+        `Voice track ${index + 1} has no usable audio URL or Cloudinary public ID.`
+      );
+    }
+
+    return {
+      publicId,
+      audioUrl,
+      startTime,
+    };
+  });
 }
 
 async function downloadFile(url, outputPath) {
-  if (
-    typeof url !== "string" ||
-    (!url.startsWith("https://") &&
-      !url.startsWith("http://"))
-  ) {
+  if (!isHttpUrl(url)) {
     throw new Error(
-      "Media URL must be a valid HTTP or HTTPS URL."
+      "Media URL must use HTTP or HTTPS."
     );
   }
 
-  const response = await fetch(url, {
-    cache: "no-store",
-  });
+  const controller = new AbortController();
 
-  if (!response.ok) {
-    throw new Error(
-      `Unable to download media. HTTP ${response.status}`
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 90000);
+
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      signal: controller.signal,
+      redirect: "follow",
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Unable to download media. HTTP ${response.status}.`
+      );
+    }
+
+    const declaredLength = Number(
+      response.headers.get("content-length") || 0
     );
-  }
 
-  const buffer = Buffer.from(
-    await response.arrayBuffer()
-  );
+    if (
+      declaredLength > MAX_DOWNLOAD_BYTES
+    ) {
+      throw new Error(
+        "The media file is too large to process."
+      );
+    }
 
-  if (!buffer.length) {
-    throw new Error(
-      "Downloaded media file is empty."
+    const buffer = Buffer.from(
+      await response.arrayBuffer()
     );
+
+    if (!buffer.length) {
+      throw new Error(
+        "The downloaded media file is empty."
+      );
+    }
+
+    if (buffer.length > MAX_DOWNLOAD_BYTES) {
+      throw new Error(
+        "The media file exceeds the allowed size."
+      );
+    }
+
+    await fs.writeFile(outputPath, buffer);
+
+    return outputPath;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  await fs.writeFile(
-    outputPath,
-    buffer
-  );
-
-  return outputPath;
 }
 
 function runFfmpeg({
@@ -89,392 +236,225 @@ function runFfmpeg({
   soundPath,
   outputPath,
 }) {
-  return new Promise(
-    (resolve, reject) => {
-      try {
-        if (!videoPath) {
-          reject(
-            new Error(
-              "FFmpeg video input is missing."
-            )
-          );
-          return;
-        }
-
-        if (!audioPaths?.length) {
-          reject(
-            new Error(
-              "FFmpeg requires at least one voice track."
-            )
-          );
-          return;
-        }
-
-        const command =
-          ffmpeg(videoPath);
-
-        /*
-          INPUT ORDER
-
-          0 = video
-          1 = background sound, if present
-          2+ = character voices
-        */
-
-        if (soundPath) {
-          command.input(soundPath);
-        }
-
-        audioPaths.forEach(
-          (audioPath) => {
-            command.input(audioPath);
-          }
-        );
-
-        const filterParts = [];
-
-        /*
-          Prepare each character voice
-          with its individual start time.
-        */
-
-        audioPaths.forEach(
-          (_, index) => {
-            const delaySeconds =
-              Number(
-                audioStartTimes?.[
-                  index
-                ] ?? 0
-              );
-
-            const safeDelay =
-              Number.isFinite(
-                delaySeconds
-              ) &&
-              delaySeconds >= 0
-                ? delaySeconds
-                : 0;
-
-            const delayMs =
-              Math.round(
-                safeDelay * 1000
-              );
-
-            const inputIndex =
-              index +
-              (soundPath ? 2 : 1);
-
-            filterParts.push(
-              `[${inputIndex}:a]adelay=${delayMs}|${delayMs}[voice${index}]`
-            );
-          }
-        );
-
-        /*
-          Mix all character voices.
-        */
-
-        const mixInputs =
-          audioPaths
-            .map(
-              (_, index) =>
-                `[voice${index}]`
-            )
-            .join("");
-
-        filterParts.push(
-          `${mixInputs}amix=inputs=${audioPaths.length}:duration=longest:dropout_transition=0[mixedVoice]`
-        );
-
-        /*
-          Add background sound when available.
-        */
-
-        if (soundPath) {
-          filterParts.push(
-            `[1:a]volume=0.22[backgroundSound]`
-          );
-
-          filterParts.push(
-            `[mixedVoice][backgroundSound]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[mixedAudio]`
-          );
-        } else {
-          filterParts.push(
-            `[mixedVoice]anull[mixedAudio]`
-          );
-        }
-
-        command
-          .complexFilter(
-            filterParts
-          )
-          .outputOptions([
-            "-map 0:v:0",
-            "-map [mixedAudio]",
-            "-c:v copy",
-            "-c:a aac",
-            "-b:a 192k",
-            "-shortest",
-            "-movflags +faststart",
-          ])
-          .on(
-            "start",
-            (commandLine) => {
-              console.log(
-                "BOMBA FFMPEG START:",
-                commandLine
-              );
-            }
-          )
-          .on(
-            "progress",
-            (progress) => {
-              if (
-                typeof progress?.percent ===
-                "number"
-              ) {
-                console.log(
-                  `BOMBA FFMPEG PROGRESS: ${progress.percent.toFixed(
-                    1
-                  )}%`
-                );
-              }
-            }
-          )
-          .on(
-            "end",
-            () => {
-              console.log(
-                "BOMBA FFMPEG COMPLETE"
-              );
-
-              resolve();
-            }
-          )
-          .on(
-            "error",
-            (error) => {
-              console.error(
-                "BOMBA FFMPEG ERROR:",
-                error
-              );
-
-              reject(error);
-            }
-          )
-          .save(outputPath);
-      } catch (error) {
-        reject(error);
-      }
+  return new Promise((resolve, reject) => {
+    if (!videoPath) {
+      reject(
+        new Error("FFmpeg video input is missing.")
+      );
+      return;
     }
-  );
+
+    if (!audioPaths?.length) {
+      reject(
+        new Error(
+          "At least one character voice track is required."
+        )
+      );
+      return;
+    }
+
+    const command = ffmpeg(videoPath);
+
+    /*
+      Input order:
+      0 = video
+      1 = background music, if present
+      Remaining inputs = character voices
+    */
+
+    if (soundPath) {
+      command.input(soundPath);
+    }
+
+    for (const audioPath of audioPaths) {
+      command.input(audioPath);
+    }
+
+    const filters = [];
+
+    audioPaths.forEach((_, index) => {
+      const seconds = Number(
+        audioStartTimes[index] ?? 0
+      );
+
+      const safeSeconds =
+        Number.isFinite(seconds) && seconds >= 0
+          ? seconds
+          : 0;
+
+      const delayMs = Math.round(
+        safeSeconds * 1000
+      );
+
+      const inputIndex =
+        index + (soundPath ? 2 : 1);
+
+      filters.push(
+        `[${inputIndex}:a]` +
+          `adelay=${delayMs}|${delayMs},` +
+          `aresample=44100,` +
+          `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo` +
+          `[voice${index}]`
+      );
+    });
+
+    const voiceInputs = audioPaths
+      .map((_, index) => `[voice${index}]`)
+      .join("");
+
+    filters.push(
+      `${voiceInputs}` +
+        `amix=inputs=${audioPaths.length}:duration=longest:dropout_transition=0:normalize=0,` +
+        `alimiter=limit=0.95[mixedVoice]`
+    );
+
+    if (soundPath) {
+      filters.push(
+        `[1:a]` +
+          `volume=0.18,` +
+          `aresample=44100,` +
+          `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo` +
+          `[backgroundMusic]`
+      );
+
+      filters.push(
+        `[mixedVoice][backgroundMusic]` +
+          `amix=inputs=2:duration=first:dropout_transition=0:normalize=0,` +
+          `alimiter=limit=0.95[mixedAudio]`
+      );
+    } else {
+      filters.push(
+        `[mixedVoice]anull[mixedAudio]`
+      );
+    }
+
+    command
+      .complexFilter(filters)
+      .outputOptions([
+        "-map 0:v:0",
+        "-map [mixedAudio]",
+        "-c:v copy",
+        "-c:a aac",
+        "-b:a 192k",
+        "-ar 44100",
+        "-ac 2",
+        "-movflags +faststart",
+        "-max_muxing_queue_size 2048",
+      ])
+      .on("start", (commandLine) => {
+        console.log(
+          "BOMBA FINALIZER FFMPEG START:",
+          commandLine
+        );
+      })
+      .on("progress", (progress) => {
+        if (typeof progress?.percent === "number") {
+          console.log(
+            `BOMBA FINALIZER PROGRESS: ${progress.percent.toFixed(1)}%`
+          );
+        }
+      })
+      .on("error", (error) => {
+        console.error(
+          "BOMBA FINALIZER FFMPEG ERROR:",
+          error
+        );
+
+        reject(error);
+      })
+      .on("end", () => {
+        console.log(
+          "BOMBA FINALIZER FFMPEG COMPLETE"
+        );
+
+        resolve();
+      })
+      .save(outputPath);
+  });
 }
 
-export async function POST(
-  request
-) {
+export async function POST(request) {
   let workDir = "";
 
   try {
     /*
-      ============================================
-      01 — CONFIGURATION CHECK
-      ============================================
+      01 — CONFIGURATION
     */
 
     if (!CLOUDINARY_CLOUD_NAME) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME is not configured.",
-        },
-        { status: 500 }
+      return jsonError(
+        "NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME is not configured.",
+        500
       );
     }
 
     if (!CLOUDINARY_VIDEO_PRESET) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "NEXT_PUBLIC_CLOUDINARY_VIDEO_PRESET is not configured.",
-        },
-        { status: 500 }
+      return jsonError(
+        "NEXT_PUBLIC_CLOUDINARY_VIDEO_PRESET is not configured.",
+        500
       );
     }
 
     if (!ffmpegPath) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "FFmpeg binary is not available.",
-        },
-        { status: 500 }
+      return jsonError(
+        "The FFmpeg binary is unavailable.",
+        500
       );
     }
 
-    console.log(
-      "BOMBA FFMPEG STATIC PATH:",
-      ffmpegPath
-    );
-
-    ffmpeg.setFfmpegPath(
-      ffmpegPath
-    );
+    ffmpeg.setFfmpegPath(ffmpegPath);
 
     /*
-      ============================================
-      02 — READ REQUEST
-      ============================================
+      02 — REQUEST
     */
 
-    const body =
-      await request.json();
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError(
+        "The request body must contain valid JSON.",
+        400
+      );
+    }
 
     const videoUrl =
-      typeof body?.videoUrl ===
-      "string"
+      typeof body?.videoUrl === "string"
         ? body.videoUrl.trim()
         : "";
 
-    /*
-      ============================================
-      03 — VOICE TRACKS
-      ============================================
-    */
-
-    const incomingVoiceTracks =
-      Array.isArray(
-        body?.voiceTracks
-      )
-        ? body.voiceTracks
-        : [];
-
-    const legacyVoicePublicId =
-      typeof body?.voicePublicId ===
-      "string"
-        ? body.voicePublicId.trim()
-        : "";
-
-    const voiceTracks =
-      incomingVoiceTracks.length >
-      0
-        ? incomingVoiceTracks
-            .map((track) => ({
-              publicId:
-                typeof track?.publicId ===
-                "string"
-                  ? track.publicId.trim()
-                  : "",
-
-              startTime:
-                Number.isFinite(
-                  Number(
-                    track?.startTime
-                  )
-                )
-                  ? Math.max(
-                      0,
-                      Number(
-                        track.startTime
-                      )
-                    )
-                  : 0,
-            }))
-            .filter(
-              (track) =>
-                track.publicId
-            )
-        : legacyVoicePublicId
-        ? [
-            {
-              publicId:
-                legacyVoicePublicId,
-              startTime: 0,
-            },
-          ]
-        : [];
-
-    /*
-      ============================================
-      04 — VALIDATE REQUEST
-      ============================================
-    */
-
-    if (!videoUrl) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "videoUrl is required.",
-        },
-        { status: 400 }
+    if (!isHttpUrl(videoUrl)) {
+      return jsonError(
+        "A valid HTTP or HTTPS videoUrl is required.",
+        400
       );
     }
 
-    if (
-      !videoUrl.startsWith(
-        "https://"
-      ) &&
-      !videoUrl.startsWith(
-        "http://"
-      )
-    ) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "The supplied video URL must be a valid HTTP or HTTPS URL.",
-        },
-        { status: 400 }
+    /*
+      03 — VOICE TRACKS
+    */
+
+    let voiceTracks;
+
+    try {
+      voiceTracks = normalizeVoiceTracks(body);
+    } catch (error) {
+      return jsonError(
+        error.message,
+        400
       );
     }
 
     if (!voiceTracks.length) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "At least one voice track is required.",
-        },
-        { status: 400 }
+      return jsonError(
+        "At least one voice track is required.",
+        400
       );
     }
 
     /*
-      ============================================
-      05 — LOG FINALIZATION START
-      ============================================
-    */
-
-    console.log(
-      "======================================"
-    );
-
-    console.log(
-      "BOMBA MULTI-VOICE FINAL VIDEO STARTING"
-    );
-
-    console.log(
-      "VOICE TRACK COUNT:",
-      voiceTracks.length
-    );
-
-    console.log(
-      "VOICE TRACKS:",
-      voiceTracks
-    );
-
-    console.log(
-      "======================================"
-    );
-
-    /*
-      ============================================
-      06 — CREATE TEMP DIRECTORY
-      ============================================
+      04 — TEMPORARY WORKSPACE
     */
 
     workDir = path.join(
@@ -484,23 +464,17 @@ export async function POST(
         .toString("hex")}`
     );
 
-    await fs.mkdir(
+    await fs.mkdir(workDir, {
+      recursive: true,
+    });
+
+    const videoInputPath = path.join(
       workDir,
-      {
-        recursive: true,
-      }
+      "input-video.mp4"
     );
 
-    const videoInputPath =
-      path.join(
-        workDir,
-        "input-video.mp4"
-      );
-
     /*
-      ============================================
-      07 — DOWNLOAD GENERATED VIDEO
-      ============================================
+      05 — DOWNLOAD VIDEO
     */
 
     await downloadFile(
@@ -508,185 +482,113 @@ export async function POST(
       videoInputPath
     );
 
-    console.log(
-      "BOMBA VIDEO DOWNLOADED:",
-      videoInputPath
-    );
-
     /*
-      ============================================
-      08 — DOWNLOAD CHARACTER VOICES
-      ============================================
+      06 — DOWNLOAD CHARACTER VOICES
     */
 
     const audioPaths = [];
     const audioStartTimes = [];
 
-    for (
-      let index = 0;
-      index < voiceTracks.length;
-      index++
-    ) {
-      const track =
-        voiceTracks[index];
+    for (let index = 0; index < voiceTracks.length; index++) {
+      const track = voiceTracks[index];
 
-      const audioUrl =
-        cloudinaryAudioUrl(
-          track.publicId
-        );
-
-      if (!audioUrl) {
-        throw new Error(
-          `Unable to create Cloudinary audio URL for voice track ${index + 1}.`
-        );
-      }
-
-      const audioPath =
-        path.join(
-          workDir,
-          `voice-${index}.mp3`
-        );
+      const audioPath = path.join(
+        workDir,
+        `voice-${index}.mp3`
+      );
 
       console.log(
-        `BOMBA DOWNLOADING VOICE ${
-          index + 1
-        }:`,
-        audioUrl
+        `BOMBA DOWNLOADING VOICE ${index + 1}`
       );
 
       await downloadFile(
-        audioUrl,
+        track.audioUrl,
         audioPath
       );
 
-      audioPaths.push(
-        audioPath
-      );
-
-      audioStartTimes.push(
-        track.startTime
-      );
+      audioPaths.push(audioPath);
+      audioStartTimes.push(track.startTime);
     }
 
     /*
-      ============================================
-      09 — OPTIONAL BACKGROUND SOUND
-      ============================================
+      07 — OPTIONAL BACKGROUND MUSIC
     */
 
     let soundPath = "";
 
     const soundUrl =
-      typeof body?.sound
-        ?.audioUrl === "string"
+      typeof body?.sound?.audioUrl === "string"
         ? body.sound.audioUrl.trim()
         : "";
 
     if (soundUrl) {
-      if (
-        !soundUrl.startsWith(
-          "https://"
-        ) &&
-        !soundUrl.startsWith(
-          "http://"
-        )
-      ) {
-        throw new Error(
-          "The supplied background sound URL must be a valid HTTP or HTTPS URL."
+      if (!isHttpUrl(soundUrl)) {
+        return jsonError(
+          "The background music URL is invalid.",
+          400
         );
       }
 
       soundPath = path.join(
         workDir,
-        "background-sound.mp3"
-      );
-
-      console.log(
-        "BOMBA DOWNLOADING BACKGROUND SOUND:",
-        soundUrl
+        "background-music.mp3"
       );
 
       await downloadFile(
         soundUrl,
         soundPath
       );
-
-      console.log(
-        "BOMBA BACKGROUND SOUND DOWNLOADED:",
-        soundPath
-      );
     }
 
     /*
-      ============================================
-      10 — MIX VIDEO + VOICES + SOUND
-      ============================================
+      08 — MIX AUDIO WITH VIDEO
     */
 
-    const mixedVideoPath =
-      path.join(
-        workDir,
-        "mixed-video.mp4"
-      );
+    const mixedVideoPath = path.join(
+      workDir,
+      "bomba-final-video.mp4"
+    );
 
     await runFfmpeg({
-      videoPath:
-        videoInputPath,
-
+      videoPath: videoInputPath,
       audioPaths,
-
       audioStartTimes,
-
       soundPath,
-
-      outputPath:
-        mixedVideoPath,
+      outputPath: mixedVideoPath,
     });
 
     /*
-      ============================================
-      11 — VERIFY OUTPUT
-      ============================================
+      09 — VERIFY OUTPUT
     */
 
-    const outputStats =
-      await fs.stat(
-        mixedVideoPath
-      );
+    const outputStats = await fs.stat(
+      mixedVideoPath
+    );
 
     if (
       !outputStats.isFile() ||
       outputStats.size === 0
     ) {
       throw new Error(
-        "FFmpeg completed but produced an empty final video."
+        "FFmpeg did not produce a valid final video."
       );
     }
 
-    console.log(
-      "BOMBA MIXED VIDEO SIZE:",
-      outputStats.size
-    );
-
     /*
-      ============================================
-      12 — UPLOAD FINAL VIDEO
-      ============================================
+      10 — UPLOAD FINAL VIDEO
     */
 
-    const uploadFormData =
-      new FormData();
+    const videoBuffer = await fs.readFile(
+      mixedVideoPath
+    );
 
-    const finishedVideoBuffer =
-      await fs.readFile(
-        mixedVideoPath
-      );
+    const uploadFormData = new FormData();
 
     uploadFormData.append(
       "file",
-      new Blob([
-        finishedVideoBuffer,
-      ]),
+      new Blob([videoBuffer], {
+        type: "video/mp4",
+      }),
       "bomba-final-video.mp4"
     );
 
@@ -695,124 +597,78 @@ export async function POST(
       CLOUDINARY_VIDEO_PRESET
     );
 
-    const uploadResponse =
-      await fetch(
-        CLOUDINARY_UPLOAD_URL,
-        {
-          method: "POST",
-          body: uploadFormData,
-          cache: "no-store",
-        }
-      );
-
-    const uploadText =
-      await uploadResponse.text();
-
-    const uploadData =
-      safeParse(
-        uploadText
-      );
-
-    console.log(
-      "BOMBA FINAL CLOUDINARY UPLOAD STATUS:",
-      uploadResponse.status
+    const uploadResponse = await fetch(
+      CLOUDINARY_UPLOAD_URL,
+      {
+        method: "POST",
+        body: uploadFormData,
+        cache: "no-store",
+      }
     );
 
-    if (
-      !uploadResponse.ok
-    ) {
+    const uploadText = await uploadResponse.text();
+    const uploadData = safeParse(uploadText);
+
+    if (!uploadResponse.ok) {
       console.error(
-        "BOMBA FINAL CLOUDINARY UPLOAD ERROR:",
-        uploadText.slice(
-          0,
-          1500
-        )
+        "BOMBA CLOUDINARY UPLOAD ERROR:",
+        uploadText.slice(0, 1200)
       );
 
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            uploadData?.error
-              ?.message ||
-            uploadData?.error ||
-            `Cloudinary final video upload failed with HTTP ${uploadResponse.status}.`,
-        },
-        {
-          status:
-            uploadResponse.status >=
-              400 &&
-            uploadResponse.status <
-              500
-              ? uploadResponse.status
-              : 502,
-        }
+      return jsonError(
+        uploadData?.error?.message ||
+          `Final video upload failed with HTTP ${uploadResponse.status}.`,
+        502
       );
     }
 
     /*
-      ============================================
-      13 — VERIFY CLOUDINARY RESPONSE
-      ============================================
+      11 — VERIFY CLOUDINARY RESULT
     */
-
-    const finalVideoPublicId =
-      uploadData?.public_id;
 
     const finalVideoUrl =
       uploadData?.secure_url ||
-      uploadData?.url;
+      uploadData?.url ||
+      "";
+
+    const finalVideoPublicId =
+      uploadData?.public_id || "";
 
     if (
-      !finalVideoPublicId ||
-      !finalVideoUrl
+      !finalVideoUrl ||
+      !finalVideoPublicId
     ) {
-      return NextResponse.json(
-        {
-          status: "failed",
-          error:
-            "Cloudinary uploaded the final video but did not return a usable video URL.",
-        },
-        { status: 502 }
+      return jsonError(
+        "Cloudinary did not return a valid final video URL.",
+        502
       );
     }
 
+    /*
+      12 — SUCCESS
+    */
+
     console.log(
-      "BOMBA FINAL VIDEO PUBLIC ID:",
+      "BOMBA FINAL VIDEO COMPLETE:",
       finalVideoPublicId
     );
-
-    console.log(
-      "BOMBA FINAL VIDEO READY"
-    );
-
-    /*
-      ============================================
-      14 — RETURN FINAL VIDEO
-      ============================================
-    */
 
     return NextResponse.json(
       {
         status: "completed",
-
-        videoUrl:
-          finalVideoUrl,
-
-        finalVideoUrl:
-          finalVideoUrl,
-
-        cloudinaryVideoPublicId:
-          finalVideoPublicId,
-
-        voiceTracks,
+        videoUrl: finalVideoUrl,
+        finalVideoUrl,
+        cloudinaryVideoPublicId: finalVideoPublicId,
+        voiceTracks: voiceTracks.map((track) => ({
+          publicId: track.publicId,
+          startTime: track.startTime,
+        })),
+        soundIncluded: Boolean(soundPath),
       },
       {
         status: 200,
-
         headers: {
-          "Cache-Control":
-            "no-store",
+          "Cache-Control": "no-store",
         },
       }
     );
@@ -822,39 +678,26 @@ export async function POST(
       error
     );
 
-    return NextResponse.json(
-      {
-        status: "failed",
-        error:
-          error?.message ||
-          "Unable to combine the video and character voices.",
-      },
-      { status: 500 }
+    return jsonError(
+      error?.message ||
+        "Unable to combine the video, voices, and background music.",
+      500
     );
   } finally {
-    /*
-      ============================================
-      15 — CLEAN TEMP FILES
-      ============================================
-    */
-
     if (workDir) {
       try {
-        await fs.rm(
-          workDir,
-          {
-            recursive: true,
-            force: true,
-          }
-        );
+        await fs.rm(workDir, {
+          recursive: true,
+          force: true,
+        });
 
         console.log(
-          "BOMBA TEMP DIRECTORY CLEANED"
+          "BOMBA TEMPORARY FILES CLEANED"
         );
-      } catch (cleanupError) {
+      } catch (error) {
         console.error(
           "BOMBA TEMP CLEANUP ERROR:",
-          cleanupError
+          error
         );
       }
     }
