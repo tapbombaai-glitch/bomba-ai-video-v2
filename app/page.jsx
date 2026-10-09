@@ -1593,11 +1593,6 @@ setVideoUrl(generatedVideoUrl);
 setStatus(
   "Video generated. Preparing audio finalization..."
 );
-
-throw new Error(
-  "Eternal AI returned a temporary video file. The video must be uploaded to a server-accessible URL before BOMBA can attach the generated voices."
-);
-
           const finalVideoUrl =
   await finalizeVideoWithVoice(
     directVideoUrl,
