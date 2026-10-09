@@ -11,7 +11,6 @@ const NAIJALINGO_URL = "https://api.9jalingo.org/v1/audio/speech";
 const MAX_TEXT_LENGTH = 5000;
 const REQUEST_TIMEOUT_MS = 45000;
 
-// Send a consistent JSON error response.
 function jsonError(message, status, extra = {}) {
   return NextResponse.json(
     {
@@ -28,40 +27,114 @@ function jsonError(message, status, extra = {}) {
   );
 }
 
-// Read retry information without exposing provider error details.
-function getRetryAfterSeconds(errorText) {
+// Safely parse provider errors, including JSON inside "detail".
+function parseProviderError(errorText) {
   try {
-    const data = JSON.parse(errorText);
+    const parsed = JSON.parse(errorText);
 
-    const value =
-      data?.retry_after_seconds ??
-      data?.detail?.retry_after_seconds ??
-      data?.error?.retry_after_seconds;
+    if (typeof parsed?.detail === "string") {
+      try {
+        const nested = JSON.parse(parsed.detail);
 
-    if (value !== undefined && value !== null) {
-      const seconds = Number(value);
-
-      if (Number.isFinite(seconds) && seconds > 0) {
-        return Math.ceil(seconds);
+        return {
+          ...parsed,
+          ...nested,
+        };
+      } catch {
+        // The detail field may be ordinary text or a
+        // Python-style dictionary rather than valid JSON.
       }
     }
+
+    if (
+      parsed?.detail &&
+      typeof parsed.detail === "object"
+    ) {
+      return {
+        ...parsed,
+        ...parsed.detail,
+      };
+    }
+
+    return parsed;
   } catch {
-    // The provider may return plain text instead of JSON.
+    return {};
+  }
+}
+
+function getRetryAfterSeconds(errorText, response) {
+  // First, respect a valid standard HTTP Retry-After header.
+  const headerValue = response?.headers?.get("retry-after");
+
+  if (headerValue) {
+    const seconds = Number(headerValue);
+
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.ceil(seconds);
+    }
+
+    const retryDate = Date.parse(headerValue);
+
+    if (Number.isFinite(retryDate)) {
+      const remainingSeconds = Math.ceil(
+        (retryDate - Date.now()) / 1000
+      );
+
+      if (remainingSeconds > 0) {
+        return remainingSeconds;
+      }
+    }
   }
 
+  // Next, inspect the provider's structured error.
+  const data = parseProviderError(errorText);
+
+  const candidates = [
+    data?.retry_after_seconds,
+    data?.retryAfterSeconds,
+    data?.detail?.retry_after_seconds,
+  ];
+
+  for (const value of candidates) {
+    const seconds = Number(value);
+
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.ceil(seconds);
+    }
+  }
+
+  // Finally, inspect errors that contain a serialized
+  // Python dictionary rather than valid JSON.
   const match = errorText.match(
-    /retry_after_seconds["']?\s*:\s*["']?(\d+)/i
+    /retry_after_seconds['"]?\s*:\s*['"]?(\d+)/i
   );
 
-  return match ? Number(match[1]) : null;
+  if (match) {
+    return Number(match[1]);
+  }
+
+  return null;
+}
+
+function getProviderErrorCode(errorText) {
+  const data = parseProviderError(errorText);
+
+  return (
+    data?.error_code ||
+    data?.code ||
+    data?.detail?.error_code ||
+    null
+  );
 }
 
 export async function POST(request) {
+  let requestBody;
+
   try {
-    // 1. Check server configuration.
+    // 1. Validate server configuration.
     if (!NAIJALINGO_API_KEY) {
       console.error(
-        "BOMBA VOICE: NAIJALINGO_API_KEY is missing."
+        "BOMBA VOICE: Missing NAIJALINGO_API_KEY."
       );
 
       return jsonError(
@@ -70,31 +143,28 @@ export async function POST(request) {
       );
     }
 
-    // 2. Read the incoming request.
-    let body;
-
+    // 2. Validate the incoming request.
     try {
-      body = await request.json();
+      requestBody = await request.json();
     } catch {
       return jsonError("Invalid request body.", 400);
     }
 
     const text =
-      typeof body?.text === "string"
-        ? body.text.trim()
+      typeof requestBody?.text === "string"
+        ? requestBody.text.trim()
         : "";
 
     const voiceId =
-      typeof body?.voiceId === "string"
-        ? body.voiceId.trim()
+      typeof requestBody?.voiceId === "string"
+        ? requestBody.voiceId.trim()
         : "";
 
     const language =
-      typeof body?.language === "string"
-        ? body.language.trim()
+      typeof requestBody?.language === "string"
+        ? requestBody.language.trim()
         : "";
 
-    // 3. Validate the required fields.
     if (!text) {
       return jsonError("Voice text is required.", 400);
     }
@@ -120,8 +190,9 @@ export async function POST(request) {
       textLength: text.length,
     });
 
-    // 4. Send one request to 9jaLingo.
-    // No automatic retries: repeated requests can consume TTS quota.
+    // 3. Send exactly one request to the provider.
+    // Do not automatically retry: the provider may enforce
+    // a strict hourly request limit.
     const response = await fetch(NAIJALINGO_URL, {
       method: "POST",
       headers: {
@@ -140,56 +211,101 @@ export async function POST(request) {
       cache: "no-store",
     });
 
-    // 5. Handle errors returned by 9jaLingo.
+    // 4. Handle provider errors.
     if (!response.ok) {
       const errorText = await response.text();
 
-      // Do not log the API key, dialogue, or full provider response.
-      console.error("BOMBA VOICE: Provider request failed.", {
-        status: response.status,
+      const retryAfterSeconds = getRetryAfterSeconds(
+        errorText,
+        response
+      );
+
+      const errorCode = getProviderErrorCode(errorText);
+
+      // Log only safe diagnostic information.
+      // Never log API keys or generated dialogue.
+      console.error("BOMBA VOICE: Provider rejected request.", {
+        httpStatus: response.status,
+        errorCode,
+        retryAfterSeconds,
       });
 
-      if (response.status === 429) {
-        const retryAfterSeconds =
-          getRetryAfterSeconds(errorText);
-
+      if (
+        response.status === 429 ||
+        errorCode === "STARTER_RATE_LIMIT_EXCEEDED"
+      ) {
         return jsonError(
-          "The voice service has reached its usage limit. Please wait before trying again.",
+          "The voice service has reached its usage limit. Please wait before generating more audio.",
           429,
-          retryAfterSeconds !== null
-            ? { retryAfterSeconds }
-            : {}
+          {
+            ...(retryAfterSeconds !== null
+              ? { retryAfterSeconds }
+              : {}),
+            retryable: true,
+          }
         );
       }
 
-      if (response.status === 503) {
+      if (
+        response.status === 503 ||
+        response.status === 502 ||
+        response.status === 504
+      ) {
         return jsonError(
-          "The voice service is temporarily unavailable. Please try again later.",
-          503
+          "The voice service is starting up or temporarily unavailable. Please try again later.",
+          503,
+          {
+            ...(retryAfterSeconds !== null
+              ? { retryAfterSeconds }
+              : {}),
+            retryable: true,
+          }
         );
       }
 
       if (response.status >= 500) {
         return jsonError(
-          "The voice provider encountered an error. Please try again later.",
-          502
+          "The voice provider encountered a server error. Please try again later.",
+          502,
+          {
+            retryable: true,
+          }
         );
       }
 
       return jsonError(
         "The voice provider rejected the request. Check the voice and language settings.",
+        502,
+        {
+          retryable: false,
+        }
+      );
+    }
+
+    // 5. Confirm the response contains audio.
+    const contentType =
+      response.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+      // A successful HTTP status with JSON is not an MP3 file.
+      const errorText = await response.text();
+
+      console.error(
+        "BOMBA VOICE: Provider returned JSON instead of audio.",
+        {
+          httpStatus: response.status,
+        }
+      );
+
+      return jsonError(
+        "The voice provider did not return an audio file.",
         502
       );
     }
 
-    // 6. Read the generated audio.
     const audioBuffer = await response.arrayBuffer();
 
     if (audioBuffer.byteLength === 0) {
-      console.error(
-        "BOMBA VOICE: Provider returned empty audio."
-      );
-
       return jsonError(
         "The voice provider returned an empty audio file.",
         502
@@ -200,7 +316,7 @@ export async function POST(request) {
       bytes: audioBuffer.byteLength,
     });
 
-    // 7. Return MP3 audio to the existing frontend.
+    // 6. Preserve the existing frontend audio response.
     return new Response(audioBuffer, {
       status: 200,
       headers: {
@@ -215,16 +331,19 @@ export async function POST(request) {
       error?.name === "TimeoutError" ||
       error?.name === "AbortError";
 
-    console.error("BOMBA VOICE: Server error.", {
+    console.error("BOMBA VOICE: Server request failed.", {
       type: error?.name || "UnknownError",
       timedOut,
     });
 
     return jsonError(
       timedOut
-        ? "Voice generation took too long. Please try again later."
+        ? "Voice generation timed out. Please try again later."
         : "Unable to connect to the voice service. Please try again later.",
-      timedOut ? 504 : 502
+      timedOut ? 504 : 502,
+      {
+        retryable: true,
+      }
     );
   }
 }
