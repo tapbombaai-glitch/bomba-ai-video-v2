@@ -1580,10 +1580,23 @@ const finalizeVideoWithVoice = async (
             );
           }
 
-          const generatedVideoUrl =
-            URL.createObjectURL(
-              videoBlob
-            );
+          // TEMPORARY VIDEO PREVIEW
+// The server finalizer cannot use this blob URL.
+// Keep the original video available instead of
+// passing an invalid URL to FFmpeg.
+
+const generatedVideoUrl =
+  URL.createObjectURL(videoBlob);
+
+setVideoUrl(generatedVideoUrl);
+
+setStatus(
+  "Video generated. Preparing audio finalization..."
+);
+
+throw new Error(
+  "Eternal AI returned a temporary video file. The video must be uploaded to a server-accessible URL before BOMBA can attach the generated voices."
+);
 
           const finalVideoUrl =
   await finalizeVideoWithVoice(
