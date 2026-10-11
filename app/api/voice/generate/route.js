@@ -1,4 +1,4 @@
-hi I'm// FILE: app/api/voice/generate/route.js
+// FILE: app/api/voice/generate/route.js
 
 import { NextResponse } from "next/server";
 
@@ -11,339 +11,417 @@ const NAIJALINGO_URL = "https://api.9jalingo.org/v1/audio/speech";
 const MAX_TEXT_LENGTH = 5000;
 const REQUEST_TIMEOUT_MS = 45000;
 
-function jsonError(message, status, extra = {}) {
-  return NextResponse.json(
-    {
-      status: "failed",
-      error: message,
-      ...extra,
-    },
-    {
-      status,
-      headers: {
-        "Cache-Control": "no-store",
-      },
-    }
-  );
+const DEFAULT_VOICE = "ada_pcm";
+const DEFAULT_LANGUAGE = "pcm";
+
+function jsonError(
+  message,
+  {
+    status = 500,
+    errorCode = "VOICE_GENERATION_ERROR",
+    diagnostic = "UNKNOWN",
+    retryable = false,
+    providerStatus,
+    retryAfterSeconds,
+  } = {}
+) {
+  const body = {
+    success: false,
+    error: message,
+    errorCode,
+    diagnostic,
+    retryable,
+  };
+
+  if (Number.isInteger(providerStatus)) {
+    body.providerStatus = providerStatus;
+  }
+
+  if (Number.isInteger(retryAfterSeconds)) {
+    body.retryAfterSeconds = retryAfterSeconds;
+  }
+
+  return NextResponse.json(body, { status });
 }
 
-// Safely parse provider errors, including JSON inside "detail".
-function parseProviderError(errorText) {
+function parseRetryAfter(value) {
+  if (!value) return undefined;
+
+  const seconds = Number(value);
+
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.ceil(seconds);
+  }
+
+  const date = Date.parse(value);
+
+  if (Number.isFinite(date)) {
+    return Math.max(0, Math.ceil((date - Date.now()) / 1000));
+  }
+
+  return undefined;
+}
+
+async function readProviderError(response) {
+  let raw = "";
+
   try {
-    const parsed = JSON.parse(errorText);
-
-    if (typeof parsed?.detail === "string") {
-      try {
-        const nested = JSON.parse(parsed.detail);
-
-        return {
-          ...parsed,
-          ...nested,
-        };
-      } catch {
-        // The detail field may be ordinary text or a
-        // Python-style dictionary rather than valid JSON.
-      }
-    }
-
-    if (
-      parsed?.detail &&
-      typeof parsed.detail === "object"
-    ) {
-      return {
-        ...parsed,
-        ...parsed.detail,
-      };
-    }
-
-    return parsed;
+    raw = await response.text();
   } catch {
+    return {};
+  }
+
+  if (!raw) return {};
+
+  try {
+    const parsed = JSON.parse(raw);
+
+    const detail =
+      parsed?.detail ??
+      parsed?.error?.message ??
+      parsed?.error ??
+      parsed?.message ??
+      parsed?.message_detail ??
+      "";
+
+    const code =
+      parsed?.error_code ??
+      parsed?.code ??
+      parsed?.error?.code ??
+      "";
+
+    return {
+      message:
+        typeof detail === "string"
+          ? detail.slice(0, 300)
+          : "",
+      code:
+        typeof code === "string"
+          ? code.slice(0, 100)
+          : "",
+    };
+  } catch {
+    // Do not return arbitrary provider response text.
+    // It could contain sensitive information.
     return {};
   }
 }
 
-function getRetryAfterSeconds(errorText, response) {
-  // First, respect a valid standard HTTP Retry-After header.
-  const headerValue = response?.headers?.get("retry-after");
+function classifyProviderError(status, providerError) {
+  const providerMessage = (
+    providerError.message || ""
+  ).toLowerCase();
 
-  if (headerValue) {
-    const seconds = Number(headerValue);
+  const providerCode = (
+    providerError.code || ""
+  ).toLowerCase();
 
-    if (Number.isFinite(seconds) && seconds > 0) {
-      return Math.ceil(seconds);
-    }
+  const combined = `${providerMessage} ${providerCode}`;
 
-    const retryDate = Date.parse(headerValue);
-
-    if (Number.isFinite(retryDate)) {
-      const remainingSeconds = Math.ceil(
-        (retryDate - Date.now()) / 1000
-      );
-
-      if (remainingSeconds > 0) {
-        return remainingSeconds;
-      }
-    }
+  if (
+    status === 401 ||
+    status === 403 ||
+    combined.includes("invalid api key") ||
+    combined.includes("unauthorized") ||
+    combined.includes("authentication")
+  ) {
+    return {
+      status: 502,
+      errorCode: "VOICE_API_AUTH_ERROR",
+      diagnostic: "API_KEY_OR_PERMISSION",
+      retryable: false,
+      message:
+        "9jaLingo rejected the API credentials. Check that NAIJALINGO_API_KEY is correct in your Vercel environment variables.",
+    };
   }
 
-  // Next, inspect the provider's structured error.
-  const data = parseProviderError(errorText);
-
-  const candidates = [
-    data?.retry_after_seconds,
-    data?.retryAfterSeconds,
-    data?.detail?.retry_after_seconds,
-  ];
-
-  for (const value of candidates) {
-    const seconds = Number(value);
-
-    if (Number.isFinite(seconds) && seconds > 0) {
-      return Math.ceil(seconds);
-    }
+  if (
+    status === 429 ||
+    combined.includes("rate limit") ||
+    combined.includes("quota exceeded") ||
+    combined.includes("insufficient credits") ||
+    combined.includes("credit balance")
+  ) {
+    return {
+      status: 429,
+      errorCode: "VOICE_API_LIMIT_ERROR",
+      diagnostic: "RATE_LIMIT_OR_CREDITS",
+      retryable: true,
+      message:
+        "The voice provider reported a usage limit or credit problem. Check your 9jaLingo account, credits, and API usage limits.",
+    };
   }
 
-  // Finally, inspect errors that contain a serialized
-  // Python dictionary rather than valid JSON.
-  const match = errorText.match(
-    /retry_after_seconds['"]?\s*:\s*['"]?(\d+)/i
-  );
-
-  if (match) {
-    return Number(match[1]);
+  if (
+    status === 400 ||
+    status === 404 ||
+    status === 413 ||
+    status === 415 ||
+    status === 422
+  ) {
+    return {
+      status: 422,
+      errorCode: "VOICE_INPUT_OR_SETTINGS_ERROR",
+      diagnostic: "VOICE_SETTINGS_OR_INPUT",
+      retryable: false,
+      message:
+        "9jaLingo rejected the voice request. Check the voice ID, language, text, and response format.",
+    };
   }
 
-  return null;
-}
+  if (status >= 500) {
+    return {
+      status: 503,
+      errorCode: "VOICE_PROVIDER_UNAVAILABLE",
+      diagnostic: "PROVIDER_SERVER_ERROR",
+      retryable: true,
+      message:
+        "The voice provider returned a server error. Try again later.",
+    };
+  }
 
-function getProviderErrorCode(errorText) {
-  const data = parseProviderError(errorText);
-
-  return (
-    data?.error_code ||
-    data?.code ||
-    data?.detail?.error_code ||
-    null
-  );
+  return {
+    status: 502,
+    errorCode: "VOICE_PROVIDER_ERROR",
+    diagnostic: "PROVIDER_REJECTED_REQUEST",
+    retryable: false,
+    message:
+      "The voice provider could not complete the request. Check the provider status and configuration.",
+  };
 }
 
 export async function POST(request) {
-  let requestBody;
+  // 1. Confirm that the server has an API key.
+  if (!NAIJALINGO_API_KEY) {
+    return jsonError(
+      "The voice API key is missing. Add NAIJALINGO_API_KEY to the Vercel environment variables.",
+      {
+        status: 500,
+        errorCode: "VOICE_API_KEY_MISSING",
+        diagnostic: "CONFIGURATION_MISSING",
+      }
+    );
+  }
+
+  // 2. Read and validate the incoming request.
+  let body;
 
   try {
-    // 1. Validate server configuration.
-    if (!NAIJALINGO_API_KEY) {
-      console.error(
-        "BOMBA VOICE: Missing NAIJALINGO_API_KEY."
-      );
-
-      return jsonError(
-        "The voice service is not configured. Please contact support.",
-        500
-      );
-    }
-
-    // 2. Validate the incoming request.
-    try {
-      requestBody = await request.json();
-    } catch {
-      return jsonError("Invalid request body.", 400);
-    }
-
-    const text =
-      typeof requestBody?.text === "string"
-        ? requestBody.text.trim()
-        : "";
-
-    const voiceId =
-      typeof requestBody?.voiceId === "string"
-        ? requestBody.voiceId.trim()
-        : "";
-
-    const language =
-      typeof requestBody?.language === "string"
-        ? requestBody.language.trim()
-        : "";
-
-    if (!text) {
-      return jsonError("Voice text is required.", 400);
-    }
-
-    if (!voiceId) {
-      return jsonError("A voice ID is required.", 400);
-    }
-
-    if (!language) {
-      return jsonError("A language is required.", 400);
-    }
-
-    if (text.length > MAX_TEXT_LENGTH) {
-      return jsonError(
-        `Voice text cannot exceed ${MAX_TEXT_LENGTH} characters.`,
-        400
-      );
-    }
-
-    console.log("BOMBA VOICE: Request started.", {
-      voiceId,
-      language,
-      textLength: text.length,
+    body = await request.json();
+  } catch {
+    return jsonError("The request body must contain valid JSON.", {
+      status: 400,
+      errorCode: "INVALID_REQUEST_JSON",
+      diagnostic: "REQUEST_VALIDATION",
     });
+  }
 
-    // 3. Send exactly one request to the provider.
-    // Do not automatically retry: the provider may enforce
-    // a strict hourly request limit.
-    const response = await fetch(NAIJALINGO_URL, {
+  const text =
+    typeof body?.text === "string"
+      ? body.text
+      : typeof body?.input === "string"
+        ? body.input
+        : "";
+
+  const voice =
+    typeof body?.voiceId === "string"
+      ? body.voiceId.trim()
+      : typeof body?.voice === "string"
+        ? body.voice.trim()
+        : typeof body?.speaker === "string"
+          ? body.speaker.trim()
+          : DEFAULT_VOICE;
+
+  const language =
+    typeof body?.language === "string"
+      ? body.language.trim()
+      : typeof body?.lang === "string"
+        ? body.lang.trim()
+        : DEFAULT_LANGUAGE;
+
+  if (!text.trim()) {
+    return jsonError("Text is required to generate speech.", {
+      status: 400,
+      errorCode: "VOICE_TEXT_MISSING",
+      diagnostic: "REQUEST_VALIDATION",
+    });
+  }
+
+  if (text.length > MAX_TEXT_LENGTH) {
+    return jsonError(
+      `Text is too long. The maximum is ${MAX_TEXT_LENGTH} characters.`,
+      {
+        status: 400,
+        errorCode: "VOICE_TEXT_TOO_LONG",
+        diagnostic: "REQUEST_VALIDATION",
+      }
+    );
+  }
+
+  if (!voice || !language) {
+    return jsonError("A voice ID and language are required.", {
+      status: 400,
+      errorCode: "VOICE_SETTINGS_MISSING",
+      diagnostic: "REQUEST_VALIDATION",
+    });
+  }
+
+  // 3. Send the request to 9jaLingo.
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+
+  let providerResponse;
+
+  try {
+    providerResponse = await fetch(NAIJALINGO_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${NAIJALINGO_API_KEY}`,
         "X-API-Key": NAIJALINGO_API_KEY,
         "Content-Type": "application/json",
-        Accept: "audio/mpeg, application/json",
+        Accept: "audio/mpeg, audio/*, application/octet-stream",
       },
       body: JSON.stringify({
         input: text,
-        voice: voiceId,
+        voice,
         lang: language,
         response_format: "mp3",
       }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: controller.signal,
       cache: "no-store",
     });
-
-    // 4. Handle provider errors.
-    if (!response.ok) {
-      const errorText = await response.text();
-
-      const retryAfterSeconds = getRetryAfterSeconds(
-        errorText,
-        response
-      );
-
-      const errorCode = getProviderErrorCode(errorText);
-
-      // Log only safe diagnostic information.
-      // Never log API keys or generated dialogue.
-      console.error("BOMBA VOICE: Provider rejected request.", {
-        httpStatus: response.status,
-        errorCode,
-        retryAfterSeconds,
-      });
-
-      if (
-        response.status === 429 ||
-        errorCode === "STARTER_RATE_LIMIT_EXCEEDED"
-      ) {
-        return jsonError(
-          "The voice service has reached its usage limit. Please wait before generating more audio.",
-          429,
-          {
-            ...(retryAfterSeconds !== null
-              ? { retryAfterSeconds }
-              : {}),
-            retryable: true,
-          }
-        );
-      }
-
-      if (
-        response.status === 503 ||
-        response.status === 502 ||
-        response.status === 504
-      ) {
-        return jsonError(
-          "The voice service is starting up or temporarily unavailable. Please try again later.",
-          503,
-          {
-            ...(retryAfterSeconds !== null
-              ? { retryAfterSeconds }
-              : {}),
-            retryable: true,
-          }
-        );
-      }
-
-      if (response.status >= 500) {
-        return jsonError(
-          "The voice provider encountered a server error. Please try again later.",
-          502,
-          {
-            retryable: true,
-          }
-        );
-      }
-
-      return jsonError(
-        "The voice provider rejected the request. Check the voice and language settings.",
-        502,
-        {
-          retryable: false,
-        }
-      );
-    }
-
-    // 5. Confirm the response contains audio.
-    const contentType =
-      response.headers.get("content-type") || "";
-
-    if (contentType.includes("application/json")) {
-      // A successful HTTP status with JSON is not an MP3 file.
-      const errorText = await response.text();
-
-      console.error(
-        "BOMBA VOICE: Provider returned JSON instead of audio.",
-        {
-          httpStatus: response.status,
-        }
-      );
-
-      return jsonError(
-        "The voice provider did not return an audio file.",
-        502
-      );
-    }
-
-    const audioBuffer = await response.arrayBuffer();
-
-    if (audioBuffer.byteLength === 0) {
-      return jsonError(
-        "The voice provider returned an empty audio file.",
-        502
-      );
-    }
-
-    console.log("BOMBA VOICE: Audio generated successfully.", {
-      bytes: audioBuffer.byteLength,
-    });
-
-    // 6. Preserve the existing frontend audio response.
-    return new Response(audioBuffer, {
-      status: 200,
-      headers: {
-        "Content-Type": "audio/mpeg",
-        "Content-Length": String(audioBuffer.byteLength),
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-      },
-    });
   } catch (error) {
-    const timedOut =
-      error?.name === "TimeoutError" ||
-      error?.name === "AbortError";
+    if (error?.name === "AbortError") {
+      return jsonError(
+        "The voice provider took too long to respond. The request timed out.",
+        {
+          status: 504,
+          errorCode: "VOICE_PROVIDER_TIMEOUT",
+          diagnostic: "PROVIDER_TIMEOUT",
+          retryable: true,
+        }
+      );
+    }
 
-    console.error("BOMBA VOICE: Server request failed.", {
-      type: error?.name || "UnknownError",
-      timedOut,
+    // Do not log the API key or submitted dialogue.
+    console.error("[BOMBA Voice] Provider connection failed.", {
+      errorName: error?.name || "UnknownError",
     });
 
     return jsonError(
-      timedOut
-        ? "Voice generation timed out. Please try again later."
-        : "Unable to connect to the voice service. Please try again later.",
-      timedOut ? 504 : 502,
+      "BOMBA could not connect to the voice provider. Check the provider connection and try again.",
       {
+        status: 502,
+        errorCode: "VOICE_PROVIDER_CONNECTION_ERROR",
+        diagnostic: "NETWORK_CONNECTION",
+        retryable: true,
+      }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  // 4. Handle unsuccessful provider responses.
+  if (!providerResponse.ok) {
+    const providerError = await readProviderError(
+      providerResponse
+    );
+
+    const classified = classifyProviderError(
+      providerResponse.status,
+      providerError
+    );
+
+    const retryAfterSeconds = parseRetryAfter(
+      providerResponse.headers.get("retry-after")
+    );
+
+    console.error("[BOMBA Voice] Provider rejected request.", {
+      providerStatus: providerResponse.status,
+      errorCode: classified.errorCode,
+      providerCode: providerError.code || undefined,
+    });
+
+    return jsonError(classified.message, {
+      ...classified,
+      providerStatus: providerResponse.status,
+      retryAfterSeconds,
+    });
+  }
+
+  // 5. Confirm the provider returned audio, not an error message.
+  const contentType = (
+    providerResponse.headers.get("content-type") || ""
+  ).toLowerCase();
+
+  const isAudio =
+    contentType.startsWith("audio/") ||
+    contentType.includes("application/octet-stream");
+
+  if (!isAudio) {
+    const providerError = await readProviderError(
+      providerResponse
+    );
+
+    console.error(
+      "[BOMBA Voice] Unexpected successful response format.",
+      {
+        contentType: contentType || "missing",
+        providerCode: providerError.code || undefined,
+      }
+    );
+
+    return jsonError(
+      "The voice provider responded, but did not return an audio file. Check the provider response and account configuration.",
+      {
+        status: 502,
+        errorCode: "VOICE_PROVIDER_INVALID_RESPONSE",
+        diagnostic: "EXPECTED_AUDIO_RECEIVED_OTHER_DATA",
+        retryable: false,
+      }
+    );
+  }
+
+  // 6. Read the audio and ensure it is not empty.
+  let audioBuffer;
+
+  try {
+    audioBuffer = await providerResponse.arrayBuffer();
+  } catch {
+    return jsonError(
+      "BOMBA received a response but could not read the audio data.",
+      {
+        status: 502,
+        errorCode: "VOICE_AUDIO_READ_ERROR",
+        diagnostic: "AUDIO_READ_FAILED",
         retryable: true,
       }
     );
   }
+
+  if (!audioBuffer || audioBuffer.byteLength === 0) {
+    return jsonError(
+      "The voice provider returned an empty audio file.",
+      {
+        status: 502,
+        errorCode: "VOICE_AUDIO_EMPTY",
+        diagnostic: "EMPTY_AUDIO",
+        retryable: true,
+      }
+    );
+  }
+
+  // 7. Return the MP3 audio to BOMBA.
+  return new Response(audioBuffer, {
+    status: 200,
+    headers: {
+      "Content-Type": "audio/mpeg",
+      "Content-Length": String(audioBuffer.byteLength),
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }
